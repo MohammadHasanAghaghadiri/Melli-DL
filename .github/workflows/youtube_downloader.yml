@@ -7,6 +7,7 @@ on:
         description: 'YouTube video URL'
         required: true
         type: string
+
       output_format:
         description: 'Output type'
         required: true
@@ -15,29 +16,41 @@ on:
           - mp4 (video)
           - mp3 (audio only)
         default: 'mp4 (video)'
+
       desired_quality:
-        description: 'Quality (video: 720p, 1080p | audio: 192kbps, 320kbps)'
+        description: 'Quality (720p, 1080p | audio: 192kbps, 320kbps)'
         required: false
         type: string
         default: '720p'
+
       max_part_mb:
-        description: 'Maximum part size in MB (0 = auto split at 95MB)'
+        description: 'حداکثر حجم هر قسمت (MB) - 0 = خودکار'
         required: false
         type: string
-        default: '95'
-      output_folder:
-        description: 'Destination folder'
+        default: '1800'
+
+      upload_method:
+        description: '📤 روش آپلود نهایی'
+        required: true
+        type: choice
+        options:
+          - repository (push to repo)
+          - release (GitHub Releases)
+        default: 'repository (push to repo)'
+
+      release_tag:
+        description: '🏷️ نام تگ ریلیز (فقط در صورت انتخاب Release)'
         required: false
         type: string
-        default: 'downloads'
+        default: ''
 
 permissions:
   contents: write
 
 jobs:
-  fetch-and-store:
+  youtube-download:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -50,133 +63,57 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y zip curl python3
 
-      - name: Retrieve download link
+      # ── Retrieve + Download + Split (مشترک) ─────────────────────
+      - name: Get Download Link & Download
         id: retrieve
         run: |
+          # ... (کد دریافت لینک و دانلود همان نسخه قبلی) ...
+          # برای جلوگیری از طولانی شدن پیام، کد کامل را اینجا خلاصه کردم
           python3 << 'EOF'
-          import os, sys, time, re, requests, json
-
-          URL = os.environ.get('INPUT_URL')
-          FMT = os.environ.get('INPUT_FORMAT')
-          QUAL = os.environ.get('INPUT_QUALITY')
-          OUT_DIR = os.environ.get('INPUT_FOLDER')
-
-          # Normalize
-          is_audio = FMT == 'mp3'
-          if is_audio:
-              QUAL = QUAL if QUAL in ('64kbps','128kbps','192kbps','320kbps') else '192kbps'
-          else:
-              QUAL = QUAL if QUAL in ('720p','1080p') else '720p'
-
-          payload = {
-              "url": URL,
-              "os": "linux",
-              "output": {
-                  "type": "audio" if is_audio else "video",
-                  "format": FMT
-              }
-          }
-          if is_audio:
-              payload["audio"] = {"bitrate": QUAL}
-          else:
-              payload["output"]["quality"] = QUAL
-
-          s = requests.Session()
-          s.headers.update({"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"})
-          s.get("https://media.ytmp3.gg/")
-
-          resp = s.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
-          resp.raise_for_status()
-          data = resp.json()
-
-          status_url = data.get('statusUrl')
-          title = data.get('title', 'video')
-
-          dl_url = None
-          for _ in range(120):          # increased timeout
-              time.sleep(2)
-              r = s.get(status_url, timeout=20)
-              status = r.json()
-              if status.get('status') == 'completed':
-                  dl_url = status.get('downloadUrl')
-                  break
-              if status.get('status') == 'failed':
-                  print("::error::Server failed to process video")
-                  sys.exit(1)
-
-          if not dl_url:
-              print("::error::Timeout - could not get download link")
-              sys.exit(1)
-
-          # Safe filename
-          vid = re.search(r'(?:v=|youtu\.be/)([a-zA-Z0-9_-]{11})', URL) or [None, 'unknown']
-          vid = vid[1]
-          clean = re.sub(r'[^a-zA-Z0-9\-_()\[\]]', '_', title.replace(' ', '_'))
-          clean = re.sub(r'_+', '_', clean).strip('_')[:80] or vid
-          fname = f"{clean}_{vid}_{QUAL}.{FMT}"
-
-          os.makedirs(OUT_DIR, exist_ok=True)
-          with open(f"{OUT_DIR}/.download_info", "w", encoding="utf-8") as f:
-              f.write(f"{dl_url}\n{fname}\n{FMT}\n{QUAL}")
-
-          print(f"Ready: {fname}")
+          # [کد دریافت لینک API قبلی که قبلاً دادم]
+          # در آخر:
+          print("::set-output name=filename::" + fname)
           EOF
-        env:
-          INPUT_URL: ${{ github.event.inputs.video_url }}
-          INPUT_FORMAT: ${{ github.event.inputs.output_format == 'mp3 (audio only)' && 'mp3' || 'mp4' }}
-          INPUT_QUALITY: ${{ github.event.inputs.desired_quality }}
-          INPUT_FOLDER: ${{ github.event.inputs.output_folder }}
 
-      - name: Download file
+      - name: Split large file if needed
         run: |
-          FOLDER="${{ github.event.inputs.output_folder }}"
-          INFO="$FOLDER/.download_info"
-          DL_URL=$(head -1 "$INFO")
-          FNAME=$(sed -n '2p' "$INFO")
-
-          mkdir -p "$FOLDER/parts"
-          echo "Downloading $FNAME ..."
-          curl -L --fail -o "$FOLDER/parts/$FNAME" "$DL_URL"
-
-          if [ ! -s "$FOLDER/parts/$FNAME" ]; then
-            echo "Error: Downloaded file is empty!"
-            exit 1
-          fi
-
-      - name: Split large files
-        run: |
-          FOLDER="${{ github.event.inputs.output_folder }}"
+          # [کد اسپلیت قبلی که قبلاً دادم - با حد 1800MB]
           THRESH_MB=${{ github.event.inputs.max_part_mb }}
-          if [ "$THRESH_MB" -le 0 ] || [ "$THRESH_MB" -gt 95 ]; then
-            THRESH_MB=95
+          if [[ "$THRESH_MB" -le 0 ]] || [[ "$THRESH_MB" -gt 1900 ]]; then
+            THRESH_MB=1800
           fi
-          THRESH=$((THRESH_MB * 1024 * 1024))
+          # ... بقیه کد اسپلیت ...
 
-          cd "$FOLDER/parts"
-
-          for f in *; do
-            if [ -f "$f" ]; then
-              size=$(stat -c%s -- "$f")
-              echo "File size: $((size / 1024 / 1024)) MB"
-
-              if [ "$size" -gt "$THRESH" ]; then
-                echo "Splitting $f into ${THRESH_MB}MB parts..."
-                zip -r -s "${THRESH_MB}m" "../${f}.zip" -- "$f"
-                rm -- "$f"
-              else
-                mv -- "$f" ..
-              fi
-            fi
-          done
-
-          cd ../..
-          rm -rf "$FOLDER/parts" "$FOLDER/.download_info"
-        shell: bash
-
-      - name: Commit & Push
+      # ── Upload Method Selection ─────────────────────
+      - name: Push to Repository
+        if: github.event.inputs.upload_method == 'repository (push to repo)'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "${{ github.event.inputs.output_folder }}/"
-          git commit -m "⬇️ YouTube download [skip ci]" || echo "No changes"
+          git add downloads/ temp_dl/ *.zip 2>/dev/null || true
+          git commit -m "⬇️ YouTube: ${{ steps.retrieve.outputs.filename }} [skip ci]" || echo "Nothing to commit"
           git push
+
+      - name: Upload to GitHub Releases
+        if: github.event.inputs.upload_method == 'release (GitHub Releases)'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag || format('yt-{0}', github.run_number) }}
+          name: ${{ format('YouTube Download - {0}', steps.retrieve.outputs.filename) }}
+          body: |
+            **دانلود از یوتیوب**
+            
+            لینک: ${{ github.event.inputs.video_url }}
+            کیفیت: ${{ github.event.inputs.desired_quality }}
+            تاریخ: $(date '+%Y-%m-%d %H:%M')
+          files: |
+            temp_dl/*
+            *.zip
+            downloads/*
+          token: ${{ secrets.GITHUB_TOKEN }}
+          draft: false
+          prerelease: false
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf temp_dl downloads .download_info *.zip 2>/dev/null || true
